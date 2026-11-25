@@ -1,0 +1,130 @@
+import { resolveVideoReferer } from '~~/server/lib/videoProviders'
+
+const envInt = (key, fallback) => {
+    const n = Number(process.env[key])
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+}
+
+/**
+ * Upstream proxy knobs — low-RAM-friendly defaults.
+ * Override with NUXT_VIDEO_PROXY_* env vars when needed.
+ */
+export const VIDEO_UPSTREAM = Object.freeze({
+    chunkSize: envInt('NUXT_VIDEO_PROXY_CHUNK', 2 * 1024 * 1024),
+    maxChunk: envInt('NUXT_VIDEO_PROXY_MAX_CHUNK', 4 * 1024 * 1024),
+    metaCacheMax: envInt('NUXT_VIDEO_PROXY_META_CACHE', 128),
+    metaCacheTtlMs: 600_000,
+    timeoutMs: envInt('NUXT_VIDEO_PROXY_TIMEOUT_MS', 45_000),
+    socketIdleMs: envInt('NUXT_VIDEO_PROXY_SOCKET_IDLE_MS', 120_000),
+    maxRetries: envInt('NUXT_VIDEO_PROXY_RETRIES', 2),
+    retryBaseDelayMs: 400,
+    smallFileRedirectBytes: 10 * 1024 * 1024,
+    maxRedirects: 5,
+})
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+
+/** Provider-aware upstream headers (explicit referer, else registry; Cookie only when set). */
+export function videoUpstreamHeaders(targetUrl, { cookie = '', referer = '', accept = '*/*', range } = {}) {
+    let hostname = ''
+    let origin = ''
+    try {
+        const u = typeof targetUrl === 'string' ? new URL(targetUrl) : targetUrl
+        hostname = u.hostname
+        origin = u.origin
+    } catch {
+        /* keep empty → resolveVideoReferer falls back */
+    }
+
+    const headers = {
+        'User-Agent': UA,
+        Accept: accept,
+        'Accept-Encoding': 'identity',
+        Referer: referer || resolveVideoReferer(hostname, origin),
+    }
+    if (cookie) headers.Cookie = String(cookie)
+    if (range) headers.Range = range
+    return headers
+}
+
+export function isHlsPlaylist(url) {
+    return /\.m3u8(\?|$)/i.test(url)
+}
+
+export function absoluteMediaUrl(src) {
+    if (!src || typeof src !== 'string') return null
+    return src.startsWith('http') ? src : `https:${src}`
+}
+
+export function urlLooksHls(url) {
+    return isHlsPlaylist(url) || String(url).toLowerCase().includes('m3u8')
+}
+
+/** HLS media parts only — do not match progressive .mp4. */
+export function isHlsSegment(url, pathname = '') {
+    let path = pathname
+    if (!path) {
+        try {
+            path = new URL(url).pathname
+        } catch {
+            path = url
+        }
+    }
+    return /\.(m?ts|m4s|cmfv|aac)(\?|$)/i.test(path) || /(?:^|\/)init[^/]*\.mp4(\?|$)/i.test(path)
+}
+
+export function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms))
+}
+
+export function bindClientAbort(event) {
+    const ac = new AbortController()
+    const abort = () => {
+        if (!ac.signal.aborted) ac.abort()
+    }
+    // once() — avoid stacking close listeners if this is called more than once
+    event.node.res.once('close', () => {
+        if (!event.node.res.writableFinished) abort()
+    })
+    event.node.req.once('error', abort)
+    return ac
+}
+
+/** Drop stalled sockets (backgrounded download tabs) instead of waiting on TCP idle. */
+export function armProxySocketTimeout(event, clientAbort, ms = VIDEO_UPSTREAM.socketIdleMs) {
+    const req = event.node?.req
+    const res = event.node?.res
+    if (!(ms > 0) || !req || !res) return
+    const kill = () => {
+        if (!clientAbort.signal.aborted) clientAbort.abort()
+        try {
+            if (!res.writableEnded) res.destroy()
+        } catch { /* ignore */ }
+    }
+    try {
+        req.setTimeout(ms, kill)
+        res.setTimeout(ms, kill)
+    } catch { /* ignore */ }
+}
+
+/**
+ * Client abort + connect-budget timer.
+ * Call `clearTimer()` after response headers so the body is not killed mid-stream.
+ */
+export function combinedSignal(clientSignal, timeoutMs = VIDEO_UPSTREAM.timeoutMs) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => {
+        ac.abort(Object.assign(new Error('Upstream timeout'), { name: 'TimeoutError' }))
+    }, timeoutMs)
+    const onClient = () => ac.abort(clientSignal.reason)
+    clientSignal?.addEventListener('abort', onClient)
+
+    return {
+        signal: ac.signal,
+        clearTimer: () => clearTimeout(timer),
+        dispose: () => {
+            clearTimeout(timer)
+            clientSignal?.removeEventListener('abort', onClient)
+        },
+    }
+}
